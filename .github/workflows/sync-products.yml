@@ -1,0 +1,75 @@
+name: Kinguin Product Sync
+on:
+  schedule:
+    # Alta prioridad - cada 30 minutos
+    - cron: '*/30 * * * *'
+    # Lotes cada 2 horas con offset para evitar sobrecarga
+    - cron: '0 */2 * * *'    # Lotes 1-5 (00:00, 02:00, 04:00...)
+    - cron: '15 */2 * * *'   # Lotes 6-10 (00:15, 02:15, 04:15...)
+    - cron: '30 */2 * * *'   # Lotes 11-15 (00:30, 02:30, 04:30...)
+    - cron: '45 */2 * * *'   # Lotes 16-20 (00:45, 02:45, 04:45...)
+    # Mantenimiento cada 6 horas
+    - cron: '0 */6 * * *'
+  # También permitir ejecución manual
+  workflow_dispatch:
+
+jobs:
+  sync-priority:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Sync Priority Products
+        run: |
+          curl -X GET "https://kinguin-ml-reseller.vercel.app/api/cron/sync-priority"
+
+  sync-batch-1-5:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 */2 * * *' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        page: [1, 2, 3, 4, 5]
+    steps:
+      - name: Sync Batch Pages 1-5
+        run: |
+          curl -X GET "https://kinguin-ml-reseller.vercel.app/api/cron/sync-batch?page=${{ matrix.page }}&limit=5000"
+
+  sync-batch-6-10:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '15 */2 * * *' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        page: [6, 7, 8, 9, 10]
+    steps:
+      - name: Sync Batch Pages 6-10
+        run: |
+          curl -X GET "https://kinguin-ml-reseller.vercel.app/api/cron/sync-batch?page=${{ matrix.page }}&limit=5000"
+
+  sync-batch-11-15:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '30 */2 * * *' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        page: [11, 12, 13, 14, 15]
+    steps:
+      - name: Sync Batch Pages 11-15
+        run: |
+          curl -X GET "https://kinguin-ml-reseller.vercel.app/api/cron/sync-batch?page=${{ matrix.page }}&limit=5000"
+
+  sync-batch-16-20:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '45 */2 * * *' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        page: [16, 17, 18, 19, 20]
+    steps:
+      - name: Sync Batch Pages 16-20
+        run: |
+          curl -X GET "https://kinguin-ml-reseller.vercel.app/api/cron/sync-batch?page=${{ matrix.page }}&limit=5000"
+
+  maintenance:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 */6 * * *' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: System Maintenance
+        run: |
+          curl -X GET "https://kinguin-ml-reseller.vercel.app/api/cron/maintenance"

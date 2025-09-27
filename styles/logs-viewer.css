@@ -1,0 +1,147 @@
+/* styles/logs-viewer.css */
+/* Estilos para el visor de logs de actividad */
+
+.logs-container {
+  background-color: #1e1e1e;
+  color: #e0e0e0;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  padding: 15px;
+  border-radius: 5px;
+  border: 1px solid #333;
+  max-height: 600px;
+  overflow-y: auto;
+  margin-bottom: 20px;
+}
+
+.log-entry {
+  padding: 3px 0;
+  border-bottom: 1px solid #333;
+  line-height: 1.4;
+  display: flex;
+  align-items: flex-start;
+}
+
+.log-entry:last-child {
+  border-bottom: none;
+}
+
+.log-timestamp {
+  color: #888;
+  margin-right: 10px;
+  flex-shrink: 0;
+  font-size: 0.9em;
+}
+
+.log-type {
+  margin-right: 8px;
+  flex-shrink: 0;
+}
+
+.log-content {
+  flex-grow: 1;
+  word-wrap: break-word;
+}
+
+/* Colores para diferentes tipos de log */
+.log-info {
+  color: #64B5F6; /* Azul claro */
+}
+
+.log-success {
+  color: #81C784; /* Verde claro */
+}
+
+.log-warning {
+  color: #FFD54F; /* Amarillo */
+}
+
+.log-error {
+  color: #E57373; /* Rojo claro */
+}
+
+/* Colores para diferentes etapas del proceso */
+.stage-inicio {
+  color: #7986CB; /* Azul indigo claro */
+}
+
+.stage-info_kinguin {
+  color: #4DD0E1; /* Azul cyan claro */
+}
+
+.stage-precio {
+  color: #9575CD; /* Morado claro */
+}
+
+.stage-nuevo, .stage-actualizar {
+  color: #FFB74D; /* Naranja claro */
+}
+
+.stage-creado, .stage-aprobado {
+  color: #AED581; /* Verde lima claro */
+}
+
+.stage-descripcion {
+  color: #4DB6AC; /* Verde teal claro */
+}
+
+.stage-error, .stage-rechazado {
+  color: #F06292; /* Rosa claro */
+}
+
+/* Botones de control */
+.logs-controls {
+  margin-bottom: 10px;
+  display: flex;
+  gap: 10px;
+}
+
+.logs-button {
+  background-color: #2d2d2d;
+  border: 1px solid #444;
+  color: #e0e0e0;
+  padding: 8px 15px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.logs-button:hover {
+  background-color: #3d3d3d;
+}
+
+.logs-button:active {
+  background-color: #4d4d4d;
+}
+
+/* Tema claro (opcional) */
+.light-theme .logs-container {
+  background-color: #f5f5f5;
+  color: #333;
+  border: 1px solid #ddd;
+}
+
+.light-theme .log-entry {
+  border-bottom: 1px solid #ddd;
+}
+
+.light-theme .log-timestamp {
+  color: #666;
+}
+
+.light-theme .log-info {
+  color: #1976D2; /* Azul oscuro */
+}
+
+.light-theme .log-success {
+  color: #388E3C; /* Verde oscuro */
+}
+
+.light-theme .log-warning {
+  color: #FFA000; /* Amarillo oscuro */
+}
+
+.light-theme .log-error {
+  color: #D32F2F; /* Rojo oscuro */
+}
