@@ -1,5 +1,4 @@
-// API para productos de alta prioridad (más vendidos, nuevos lanzamientos)
-// Se ejecuta más frecuentemente para mantener productos clave actualizados
+// API para productos de prioridad con configuración dinámica de velocidad
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -7,71 +6,132 @@ export default async function handler(req, res) {
   }
 
   try {
-    console.log('🚀 Iniciando sync de alta prioridad...');
+    const { 
+      limit = 1000, 
+      priority = 'high',
+      speed = 'fast' 
+    } = req.query;
+    
+    console.log(`🚀 Sync prioridad ${priority} (${limit} productos)`);
     const startTime = Date.now();
 
-    // Productos de alta prioridad: más vendidos y nuevos lanzamientos
-    const priorityFilters = [
-      'sortBy=popularity&order=desc&limit=1000',  // Más populares
-      'sortBy=releaseDate&order=desc&limit=500',  // Más recientes
-      'activePreorder=true&limit=500'             // Pre-orders activos
-    ];
+    // Configuración según prioridad
+    const priorityConfig = {
+      ultra: {
+        filters: [
+          `sortBy=popularity&order=desc&limit=${Math.floor(limit * 0.6)}`,
+          `sortBy=releaseDate&order=desc&limit=${Math.floor(limit * 0.3)}`,
+          `activePreorder=true&limit=${Math.floor(limit * 0.1)}`
+        ],
+        chunkSize: 50,
+        timeout: 15000
+      },
+      high: {
+        filters: [
+          `sortBy=popularity&order=desc&limit=${Math.floor(limit * 0.7)}`,
+          `sortBy=releaseDate&order=desc&limit=${Math.floor(limit * 0.3)}`
+        ],
+        chunkSize: 30,
+        timeout: 20000
+      },
+      medium: {
+        filters: [
+          `sortBy=popularity&order=desc&limit=${limit}`
+        ],
+        chunkSize: 20,
+        timeout: 30000
+      }
+    };
 
-    let totalUpdated = 0;
-    let totalCreated = 0;
-    let totalSkipped = 0;
-    let totalErrors = 0;
+    const config = priorityConfig[priority] || priorityConfig.high;
+    let allProducts = [];
 
-    for (const filter of priorityFilters) {
-      try {
-        const response = await fetch(`https://api.kinguin.net/v1/products?${filter}`, {
-          headers: {
-            'X-Api-Key': process.env.KINGUIN_API_KEY
-          }
-        });
+    // Fetch paralelo según configuración
+    const responses = await Promise.allSettled(
+      config.filters.map(filter => 
+        fetch(`https://api.kinguin.net/v1/products?${filter}`, {
+          headers: { 'X-Api-Key': process.env.KINGUIN_API_KEY }
+        })
+      )
+    );
 
-        if (!response.ok) continue;
+    for (const response of responses) {
+      if (response.status === 'fulfilled' && response.value.ok) {
+        const data = await response.value.json();
+        allProducts = allProducts.concat(data.results || []);
+      }
+    }
 
-        const data = await response.json();
-        const products = data.results || [];
-        
-        console.log(`📈 Procesando ${products.length} productos prioritarios`);
+    // Eliminar duplicados y limitar
+    const uniqueProducts = allProducts
+      .filter((product, index, self) => 
+        index === self.findIndex(p => p.kinguinId === product.kinguinId)
+      )
+      .slice(0, parseInt(limit));
 
-        // Procesar en chunks pequeños para alta velocidad
-        const chunkSize = 25;
-        for (let i = 0; i < products.length; i += chunkSize) {
-          const chunk = products.slice(i, i + chunkSize);
+    console.log(`🎯 Procesando ${uniqueProducts.length} productos únicos (${priority})`);
+
+    let totalUpdated = 0, totalCreated = 0, totalSkipped = 0, totalErrors = 0;
+    const baseUrl = process.env.VERCEL_URL || 'https://kinguin-ml-reseller.vercel.app';
+
+    // Procesamiento optimizado por chunks
+    for (let i = 0; i < uniqueProducts.length; i += config.chunkSize) {
+      const chunk = uniqueProducts.slice(i, i + config.chunkSize);
+      
+      const promises = chunk.map(async (product) => {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), config.timeout);
           
-          const promises = chunk.map(async (product) => {
-            try {
-              const addResponse = await fetch(`${process.env.VERCEL_URL || 'https://kinguin-ml-reseller.vercel.app'}/api/add-product`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ productId: product.kinguinId })
-              });
-
-              const result = await addResponse.json();
-              
-              if (addResponse.ok) {
-                if (result.action === 'created') totalCreated++;
-                else if (result.action === 'updated') totalUpdated++;
-                else totalSkipped++;
-              } else {
-                totalErrors++;
-              }
-            } catch (error) {
-              totalErrors++;
-            }
+          const addResponse = await fetch(`${baseUrl}/api/add-product`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              productId: product.kinguinId,
+              priority,
+              turbo: priority === 'ultra'
+            }),
+            signal: controller.signal
           });
 
-          await Promise.allSettled(promises);
+          clearTimeout(timeoutId);
+          const result = await addResponse.json();
+          
+          if (addResponse.ok) {
+            if (result.action === 'created') return 'created';
+            else if (result.action === 'updated') return 'updated';
+            else return 'skipped';
+          } else {
+            return 'error';
+          }
+        } catch (error) {
+          return 'error';
         }
-      } catch (filterError) {
-        console.error(`Error con filtro ${filter}:`, filterError.message);
+      });
+
+      const results = await Promise.allSettled(promises);
+      
+      results.forEach(result => {
+        if (result.status === 'fulfilled') {
+          switch (result.value) {
+            case 'created': totalCreated++; break;
+            case 'updated': totalUpdated++; break;
+            case 'skipped': totalSkipped++; break;
+            case 'error': totalErrors++; break;
+          }
+        } else {
+          totalErrors++;
+        }
+      });
+
+      // Pausa adaptativa
+      if (priority !== 'ultra' && totalErrors > chunk.length * 0.2) {
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
 
     const executionTime = Math.round((Date.now() - startTime) / 1000);
+    const throughput = Math.round(uniqueProducts.length / executionTime);
 
     // Guardar estadísticas
     try {
@@ -87,31 +147,39 @@ export default async function handler(req, res) {
         products_error: totalErrors,
         execution_time_seconds: executionTime,
         metadata: {
-          priority_level: 'high',
-          filters_used: priorityFilters.length
+          priority_level: priority,
+          filters_used: config.filters.length,
+          chunk_size: config.chunkSize,
+          timeout_ms: config.timeout,
+          throughput_per_second: throughput,
+          unique_products: uniqueProducts.length
         }
       });
     } catch (dbError) {
-      console.error('Error guardando en DB:', dbError.message);
+      console.error('📊 Error guardando estadísticas:', dbError.message);
     }
 
-    console.log(`🎯 Alta prioridad completada: ${totalUpdated} actualizados, ${totalCreated} creados (${executionTime}s)`);
+    console.log(`🎯 Prioridad ${priority}: ${totalUpdated}↗️ ${totalCreated}✨ ${totalSkipped}⏭️ ${totalErrors}❌ (${executionTime}s @ ${throughput}/s)`);
 
     res.status(200).json({
       success: true,
       type: 'priority_sync',
+      priority,
+      processed: uniqueProducts.length,
       updated: totalUpdated,
       created: totalCreated,
       skipped: totalSkipped,
       errors: totalErrors,
-      execution_time_seconds: executionTime
+      execution_time_seconds: executionTime,
+      throughput_per_second: throughput
     });
 
   } catch (error) {
-    console.error('❌ Error en sync prioritario:', error.message);
+    console.error(`❌ Error en sync ${req.query.priority || 'high'}:`, error.message);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      priority: req.query.priority || 'high'
     });
   }
 }
