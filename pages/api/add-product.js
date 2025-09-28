@@ -191,10 +191,38 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
   try {
     await logStep("INICIO", `Procesando producto Kinguin ID: ${kinguinId}`, { existingProduct }, jobId);
     
-    // 🚫 VERIFICACIÓN CRÍTICA TEMPRANA: Detener INMEDIATAMENTE si ya existe
+    // 🚫 PASO 1: VERIFICACIÓN CRÍTICA DE SKU EN MERCADOLIBRE (ANTES de crear nada en Supabase)
+    await logStep("SKU_VERIFICATION_FIRST", `🔍 VERIFICACIÓN CRÍTICA SKU - Verificando SKU ${kinguinId} en MercadoLibre ANTES de crear registro`, { 
+      kinguin_id: kinguinId 
+    }, jobId);
+    
+    const skuCheck = await checkSkuDuplicateInMercadoLibre(kinguinId.toString(), ML_ACCESS_TOKEN, jobId);
+    
+    if (skuCheck.isDuplicate) {
+      await logDecision("SKU_DUPLICATE_EARLY_REJECTION", `🚫 PRODUCTO RECHAZADO - SKU ya existe en MercadoLibre (NO se creará registro en Supabase)`, {
+        kinguin_id: kinguinId,
+        duplicate_sku: kinguinId,
+        existing_ml_id: skuCheck.existingItem.ml_id,
+        existing_title: skuCheck.existingItem.title,
+        existing_price: skuCheck.existingItem.price
+      }, jobId);
+
+      return {
+        kinguinId,
+        status: 'skipped',
+        reason: 'sku_duplicate_in_mercadolibre_early_check',
+        message: `SKU ${kinguinId} ya existe en MercadoLibre (ML ID: ${skuCheck.existingItem.ml_id}) - No se creó registro en Supabase`,
+        existing_item: skuCheck.existingItem,
+        success: false
+      };
+    }
+    
+    await logStep("SKU_UNIQUE_CONFIRMED", `✅ SKU único confirmado, procediendo con creación en Supabase`, { sku: kinguinId }, jobId);
+    
+    // 🚫 PASO 2: VERIFICACIÓN CRÍTICA TEMPRANA EN SUPABASE: Detener INMEDIATAMENTE si ya existe
     await logStep("VERIFICACION_TEMPRANA", `🔍 VERIFICACIÓN CRÍTICA - Buscando duplicados para Kinguin ID: ${kinguinId}`, { kinguin_id: kinguinId }, jobId);
     
-    // ✅ RESERVA ATÓMICA: Intentar reservar el Kinguin ID insertando un registro de "processing"
+    // ✅ PASO 3: RESERVA ATÓMICA: Intentar reservar el Kinguin ID insertando un registro de "processing"
     const reservationData = {
       kinguin_id: kinguinId,
       status: 'processing',
@@ -1350,40 +1378,6 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
         condition: mlItemData.condition,
         listing_type_id: mlItemData.listing_type_id
       }, jobId);
-      
-      // ✅ VERIFICACIÓN CRÍTICA: Comprobar duplicados por SKU en MercadoLibre ANTES de publicar
-      await logStep("SKU_VERIFICATION", `🔍 Verificando SKU duplicado: ${kinguinId}`, { sku: kinguinId }, jobId);
-      
-      const skuCheck = await checkSkuDuplicateInMercadoLibre(kinguinId.toString(), ML_ACCESS_TOKEN, jobId);
-      
-      if (skuCheck.isDuplicate) {
-        await logDecision("SKU_DUPLICATE_REJECTED", `🚫 PRODUCTO RECHAZADO - SKU ya existe en MercadoLibre`, {
-          kinguin_id: kinguinId,
-          duplicate_sku: kinguinId,
-          existing_ml_id: skuCheck.existingItem.ml_id,
-          existing_title: skuCheck.existingItem.title,
-          existing_price: skuCheck.existingItem.price
-        }, jobId);
-
-        // Limpiar registro de procesamiento
-        await supabase
-          .from("published_products")
-          .delete()
-          .eq("kinguin_id", kinguinId)
-          .eq("status", "processing")
-          .is("ml_id", null);
-
-        return {
-          kinguinId,
-          status: 'skipped',
-          reason: 'sku_duplicate_in_mercadolibre',
-          message: `SKU ${kinguinId} ya existe en MercadoLibre (ML ID: ${skuCheck.existingItem.ml_id})`,
-          existing_item: skuCheck.existingItem,
-          success: false
-        };
-      }
-      
-      await logStep("SKU_UNIQUE", `✅ SKU único confirmado, procediendo con publicación`, { sku: kinguinId }, jobId);
       
       // Crear el item en ML
       const { data: createdItem } = await axiosWithSmartRetry(
