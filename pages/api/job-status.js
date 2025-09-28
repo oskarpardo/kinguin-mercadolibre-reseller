@@ -140,26 +140,33 @@ export default async function handler(req, res) {
     }
   }
 
-  const { id } = req.query;
+  const { id, action } = req.query;
 
-  if (!id) {
+  // Si no es una acción especial, requiere id
+  if (!action && !id) {
     return res.status(400).json({ error: "Se requiere el parámetro 'id' del trabajo." });
   }
 
-  try {
-    const { data, error } = await supabase
-      .from("job_logs")
-      .select("status, summary, results, total_products")
-      .eq("id", id)
-      .single();
+  // Si es job normal, continuar con la lógica original
+  if (!action && id) {
+    try {
+      const { data, error } = await supabase
+        .from("job_logs")
+        .select("status, summary, results, total_products")
+        .eq("id", id)
+        .single();
 
-    if (error) throw error;
+      if (error) throw error;
 
-    // Asegurarse de que 'results' sea siempre un array para evitar errores en el cliente.
-    const responseData = { ...data, results: data.results || [] };
+      // Asegurarse de que 'results' sea siempre un array para evitar errores en el cliente.
+      const responseData = { ...data, results: data.results || [] };
 
-    return res.status(200).json(responseData);
-  } catch (error) {
-    return res.status(500).json({ error: "Error al consultar el estado del trabajo.", details: error.message });
+      return res.status(200).json(responseData);
+    } catch (error) {
+      return res.status(500).json({ error: "Error al consultar el estado del trabajo.", details: error.message });
+    }
   }
+
+  // Si llegamos aquí sin acción válida, error
+  return res.status(400).json({ error: "Parámetros inválidos" });
 }
