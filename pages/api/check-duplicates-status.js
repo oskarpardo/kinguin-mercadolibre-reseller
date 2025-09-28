@@ -10,6 +10,8 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  console.log('🚀 ANÁLISIS DE DUPLICADOS INICIADO - Versión 2.0');
+
   try {
     console.log('🔍 Iniciando análisis completo de duplicados...');
     
