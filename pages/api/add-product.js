@@ -11,8 +11,12 @@ import {
   descriptionFrom,
   postPlainDescription,
   getKinguinProduct,
-  logActivity
+  logActivity,
+  logStep,
+  logDecision
 } from "./_logic";
+// ✅ IMPORTAR VALIDACIÓN DE MERCADO para evitar infracciones de precios
+import { validateMarketPrice, isReasonableGamePrice } from "./_market-validation";
 import { 
   axiosWithSmartRetry, 
   batchRequests
@@ -26,39 +30,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-
-// ---------- Logging ----------
-async function logStep(step, message, data = null, jobId = null) {
-  console.log(`🔄 [${step}] ${message}`);
-  if (data) console.log(`📊 Datos:`, JSON.stringify(data, null, 2));
-  
-  // Registrar en sistema de logs
-  await logActivity(
-    `[${step}] ${message}`, 
-    'info',
-    data ? { data } : null,
-    jobId
-  );
-}
-
-async function logDecision(decision, reason, details = null, jobId = null) {
-  const emoji = decision === 'APROBADO' ? '✅' : 
-               decision === 'SKIP_OK' ? '✅' :  // Producto ya actualizado correctamente
-               decision === 'ACTUALIZADO' ? '✅' :  // Producto actualizado exitosamente
-               '❌';  // Solo errores reales
-  const logType = decision.startsWith('[SKIP]') ? console.warn : console.log;
-  logType(`${emoji} [${decision}] ${reason}`);
-  if (details) console.log(`📊 Detalles:`, JSON.stringify(details, null, 2));
-  
-  // Registrar en sistema de logs
-  await logActivity(
-    `[${decision}] ${reason}`,
-    decision === 'APROBADO' || decision === 'SKIP_OK' || decision === 'ACTUALIZADO' ? 'success' : 
-    (decision.startsWith('[SKIP]') ? 'warning' : 'error'),
-    details,
-    jobId
-  );
-}
 
 // ---------- Tokens desde Supabase (con fallback a ENV) ----------
 async function getTokenFromSupabase(key) {
@@ -85,6 +56,120 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
   try {
     await logStep("INICIO", `Procesando producto Kinguin ID: ${kinguinId}`, { existingProduct }, jobId);
     
+    // 🚫 VERIFICACIÓN CRÍTICA TEMPRANA: Detener INMEDIATAMENTE si ya existe
+    await logStep("VERIFICACION_TEMPRANA", `🔍 VERIFICACIÓN CRÍTICA - Buscando duplicados para Kinguin ID: ${kinguinId}`, { kinguin_id: kinguinId }, jobId);
+    
+    // ✅ RESERVA ATÓMICA: Intentar reservar el Kinguin ID insertando un registro de "processing"
+    const reservationData = {
+      kinguin_id: kinguinId,
+      status: 'processing',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    
+    try {
+      // Usar ON CONFLICT para prevenir duplicados de forma atómica
+      const { data: insertResult, error: insertError } = await supabase
+        .from("published_products")
+        .upsert(reservationData, { 
+          onConflict: 'kinguin_id',
+          ignoreDuplicates: false 
+        })
+        .select();
+        
+      if (insertError) {
+        // Si hay error de conflicto, significa que ya existe
+        await logDecision("SKIP_ATOMIC_CONFLICT", `Producto ya siendo procesado por otro proceso - Kinguin ID: ${kinguinId}`, { 
+          kinguin_id: kinguinId,
+          error: insertError.message
+        }, jobId);
+        
+        return { 
+          success: true, 
+          skipped: true, 
+          reason: "atomic_conflict",
+          message: `Producto ya siendo procesado: ${kinguinId}`
+        };
+      }
+      
+      await logStep("ATOMIC_RESERVATION", `✅ Reserva atómica exitosa para Kinguin ID: ${kinguinId}`, { kinguin_id: kinguinId }, jobId);
+      
+    } catch (atomicError) {
+      await logDecision("SKIP_ATOMIC_ERROR", `Error en reserva atómica - Kinguin ID: ${kinguinId}`, { 
+        kinguin_id: kinguinId,
+        error: atomicError.message
+      }, jobId);
+      
+      return { 
+        success: true, 
+        skipped: true, 
+        reason: "atomic_error",
+        message: `Error en reserva atómica: ${atomicError.message}`
+      };
+    }
+    
+    // Verificación adicional por si acaso
+    const { data: existingCheck, error: checkError } = await supabase
+      .from("published_products")
+      .select("id, ml_id, status, created_at")
+      .eq("kinguin_id", kinguinId)
+      .neq("status", "closed_duplicate")
+      .limit(5);
+      
+    if (checkError) {
+      await logStep("ERROR", `Error en verificación temprana: ${checkError.message}`, { error: checkError }, jobId);
+    } else if (existingCheck && existingCheck.length > 1) {
+      // Si hay más de 1 registro (el que acabamos de crear + otros), hay un problema
+      await logStep("MULTIPLE_DETECTED", `⚠️ Múltiples registros detectados para Kinguin ID ${kinguinId}: ${existingCheck.length}`, { 
+        kinguin_id: kinguinId,
+        records: existingCheck
+      }, jobId);
+      
+      // Verificar si alguno tiene ML_ID activo
+      for (const record of existingCheck) {
+        if (record.ml_id) {
+          try {
+            const mlResponse = await axiosWithSmartRetry(
+              `https://api.mercadolibre.com/items/${record.ml_id}`,
+              null,
+              {
+                method: 'get',
+                headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` },
+                timeout: 8000
+              }
+            );
+            
+            if (mlResponse.data?.status === 'active') {
+              await logDecision("SKIP_ACTIVE_EXISTS", `Producto activo encontrado - NO REPUBLICAR Kinguin ID: ${kinguinId}`, { 
+                ml_id: record.ml_id,
+                kinguin_id: kinguinId,
+                status: mlResponse.data.status,
+                price: mlResponse.data.price
+              }, jobId);
+              
+              // Remover nuestro registro de procesamiento ya que no vamos a procesar
+              await supabase
+                .from("published_products")
+                .delete()
+                .eq("kinguin_id", kinguinId)
+                .eq("status", "processing")
+                .is("ml_id", null);
+              
+              return { 
+                success: true, 
+                skipped: true, 
+                reason: "active_product_exists",
+                ml_id: record.ml_id,
+                message: `Producto ya activo en MercadoLibre: ${record.ml_id}`
+              };
+            }
+          } catch (mlError) {
+            await logStep("ML_CHECK", `Error verificando ML ID ${record.ml_id}: ${mlError.message}`, { ml_id: record.ml_id }, jobId);
+          }
+        }
+      }
+    }
+    
     // 1. Obtener detalles del producto desde Kinguin
     let productData;
     try {
@@ -107,8 +192,230 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       throw kinguinError;
     }
     
-    // Verificar si el producto ya existe en la DB y si tiene un ML ID asociado
+    // ✅ INICIALIZAR VARIABLE PARA PRODUCTO EXISTENTE
+    let existingProduct = null;
+    
+    // ✅ DETECCIÓN MEJORADA DE DUPLICADOS: Buscar ALL productos del mismo Kinguin ID (incluidos los que están en proceso)
+    const { data: allDuplicates, error: duplicateError } = await supabase
+      .from("published_products")
+      .select("*")
+      .eq("kinguin_id", kinguinId)
+      .neq("status", "closed_duplicate"); // Excluir duplicados ya cerrados
+      
+    if (duplicateError) {
+      await logStep("ERROR", `Error buscando duplicados: ${duplicateError.message}`, { error: duplicateError }, jobId);
+    }
+
+    // ✅ FILTRO CRÍTICO: Si YA HAY PRODUCTOS de este Kinguin ID (incluso sin ML_ID), DETENER
+    if (allDuplicates && allDuplicates.length > 0) {
+      await logStep("DUPLICATE_PREVENTION", `🚫 PRODUCTO YA EXISTE - Kinguin ID: ${kinguinId} tiene ${allDuplicates.length} registros`, { 
+        kinguin_id: kinguinId,
+        existing_records: allDuplicates.length,
+        records: allDuplicates.map(duplicate => ({
+          id: duplicate.id,
+          ml_id: duplicate.ml_id,
+          status: duplicate.status,
+          created_at: duplicate.created_at
+        }))
+      }, jobId);
+
+      // Verificar si hay al menos uno con ML_ID activo
+      let hasActiveProduct = false;
+      for (const duplicate of allDuplicates) {
+        if (duplicate.ml_id) {
+          try {
+            const mlCheckResponse = await axiosWithSmartRetry(
+              `https://api.mercadolibre.com/items/${duplicate.ml_id}`,
+              null,
+              {
+                method: 'get',
+                headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` }
+              }
+            );
+            
+            if (mlCheckResponse.data?.status === 'active') {
+              hasActiveProduct = true;
+              await logStep("ACTIVE_FOUND", `✅ Producto activo encontrado: ML ID ${duplicate.ml_id}`, { 
+                ml_id: duplicate.ml_id,
+                status: mlCheckResponse.data.status,
+                price: mlCheckResponse.data.price
+              }, jobId);
+              break;
+            }
+          } catch (mlError) {
+            await logStep("ML_CHECK", `ML ID ${duplicate.ml_id} no accesible: ${mlError.response?.status || 'error'}`, { 
+              ml_id: duplicate.ml_id
+            }, jobId);
+          }
+        }
+      }
+
+      if (hasActiveProduct) {
+        await logDecision("SKIP_DUPLICATE", `Producto ya existe activo - no republicar Kinguin ID: ${kinguinId}`, { 
+          kinguin_id: kinguinId,
+          reason: "duplicate_active_product"
+        }, jobId);
+        return { 
+          success: true, 
+          skipped: true, 
+          reason: "duplicate_active_product",
+          message: `Producto ya existe activo para Kinguin ID: ${kinguinId}`
+        };
+      }
+
+      // Si no hay productos activos pero hay registros recientes (últimos 10 minutos), también evitar duplicados
+      const recentRecords = allDuplicates.filter(duplicate => {
+        const createdAt = new Date(duplicate.created_at);
+        const now = new Date();
+        const diffMinutes = (now - createdAt) / (1000 * 60);
+        return diffMinutes < 10; // Menos de 10 minutos
+      });
+
+      if (recentRecords.length > 0) {
+        await logDecision("SKIP_RECENT", `Producto creado recientemente - evitando duplicado Kinguin ID: ${kinguinId}`, { 
+          kinguin_id: kinguinId,
+          recent_records: recentRecords.length,
+          reason: "recent_creation"
+        }, jobId);
+        return { 
+          success: true, 
+          skipped: true, 
+          reason: "recent_creation",
+          message: `Producto creado recientemente para Kinguin ID: ${kinguinId}`
+        };
+      }
+    }
+
+    // ✅ ESTABLECER existingProduct si hay exactamente 1 producto
+    if (allDuplicates && allDuplicates.length === 1) {
+      existingProduct = allDuplicates[0];
+      await logStep("SINGLE_PRODUCT", `📋 Un solo producto encontrado para Kinguin ID: ${kinguinId}`, { 
+        kinguin_id: kinguinId,
+        supabase_id: existingProduct.id,
+        ml_id: existingProduct.ml_id,
+        status: existingProduct.status
+      }, jobId);
+    }
+
+    let activeDuplicates = [];
+    if (allDuplicates && allDuplicates.length > 1) {
+      await logStep("DUPLICATE_DETECTION", `🔍 Encontrados ${allDuplicates.length} registros del mismo Kinguin ID: ${kinguinId}`, { 
+        total_found: allDuplicates.length,
+        kinguin_id: kinguinId,
+        ml_ids: allDuplicates.map(duplicate => duplicate.ml_id)
+      }, jobId);
+      
+      // Verificar cuáles están realmente activos en MercadoLibre
+      for (const duplicate of allDuplicates) {
+        if (!duplicate.ml_id) continue; // Skip productos sin ML_ID
+        
+        try {
+          const mlCheckResponse = await axiosWithSmartRetry(
+            `https://api.mercadolibre.com/items/${duplicate.ml_id}`,
+            null,
+            {
+              method: 'get',
+              headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` }
+            }
+          );
+          
+          if (mlCheckResponse.data?.status === 'active') {
+            activeDuplicates.push({
+              ...duplicate,
+              ml_data: mlCheckResponse.data
+            });
+          }
+          
+        } catch (mlCheckError) {
+          await logStep("ML_CHECK", `ML ID ${duplicate.ml_id} no accesible (${mlCheckError.response?.status || 'error'})`, { 
+            ml_id: duplicate.ml_id,
+            error: mlCheckError.response?.status
+          }, jobId);
+        }
+      }
+      
+      await logStep("ACTIVE_DUPLICATES", `🔍 Duplicados ACTIVOS encontrados: ${activeDuplicates.length}`, { 
+        active_count: activeDuplicates.length,
+        active_ml_ids: activeDuplicates.map(duplicate => duplicate.ml_id)
+      }, jobId);
+      
+      // ✅ LIMPIEZA AUTOMÁTICA: Si hay múltiples activos, mantener solo uno
+      if (activeDuplicates.length > 1) {
+        await logStep("CLEANUP_START", `🧹 INICIANDO LIMPIEZA - ${activeDuplicates.length} duplicados activos detectados`, { 
+          duplicates: activeDuplicates.length
+        }, jobId);
+        
+        // Ordenar por fecha de creación (mantener el más reciente) y precio (mantener el mejor precio)
+        const sortedDuplicates = activeDuplicates.sort((a, b) => {
+          // Primero por fecha (más reciente primero)
+          const dateCompare = new Date(b.created_at) - new Date(a.created_at);
+          if (dateCompare !== 0) return dateCompare;
+          
+          // Si son de la misma fecha, mantener el de mejor precio (menor precio)
+          return (a.ml_data?.price || 999999) - (b.ml_data?.price || 999999);
+        });
+        
+        const keepProduct = sortedDuplicates[0]; // Mantener el primero (más reciente/mejor precio)
+        const toDelete = sortedDuplicates.slice(1); // Eliminar el resto
+        
+        await logStep("CLEANUP_PLAN", `📋 PLAN: Mantener ML ID ${keepProduct.ml_id} (${keepProduct.ml_data?.price} CLP), eliminar ${toDelete.length} duplicados`, { 
+          keep: keepProduct.ml_id,
+          keep_price: keepProduct.ml_data?.price,
+          delete: toDelete.map(duplicate => duplicate.ml_id)
+        }, jobId);
+        
+        // Eliminar duplicados de MercadoLibre
+        for (const duplicate of toDelete) {
+          try {
+            await axiosWithSmartRetry(
+              `https://api.mercadolibre.com/items/${duplicate.ml_id}`,
+              { status: "closed" },
+              {
+                method: 'put',
+                headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` }
+              }
+            );
+            
+            await logStep("DUPLICATE_CLOSED", `✅ Duplicado cerrado en ML: ${duplicate.ml_id}`, { 
+              closed_ml_id: duplicate.ml_id
+            }, jobId);
+            
+            // Actualizar estado en Supabase
+            await supabase
+              .from("published_products")
+              .update({ 
+                status: "closed_duplicate",
+                updated_at: new Date().toISOString(),
+                ml_id: null // Remover ML ID para evitar confusiones futuras
+              })
+              .eq("id", duplicate.id);
+              
+          } catch (closeError) {
+            await logStep("ERROR", `Error cerrando duplicado ${duplicate.ml_id}: ${closeError.message}`, { 
+              error: closeError.message,
+              ml_id: duplicate.ml_id
+            }, jobId);
+          }
+        }
+        
+        // Establecer el producto a mantener como el existingProduct para continuar con la actualización
+        existingProduct = keepProduct;
+        
+        await logStep("CLEANUP_COMPLETE", `🎯 LIMPIEZA COMPLETADA - Manteniendo ML ID: ${keepProduct.ml_id}`, { 
+          kept_product: keepProduct.ml_id,
+          closed_duplicates: toDelete.length
+        }, jobId);
+      }
+    }
+    
+    // ✅ FILTRO CRÍTICO: Verificar si el producto YA ESTÁ PUBLICADO en Supabase
     if (existingProduct && existingProduct.ml_id) {
+      await logStep("SUPABASE_CHECK", `🔍 Producto YA EXISTE en Supabase con ML ID: ${existingProduct.ml_id}`, { 
+        ml_id: existingProduct.ml_id,
+        kinguin_id: kinguinId,
+        status: existingProduct.status
+      }, jobId);
+      
       // Verificar el estado actual en MercadoLibre
       try {
         const mlResponse = await axiosWithSmartRetry(
@@ -122,17 +429,30 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
         
         const mlStatus = mlResponse.data?.status || 'unknown';
         
-        await logStep("ML", `Estado en MercadoLibre: "${mlStatus}"`, { 
+        await logStep("ML_STATUS", `📊 Estado en MercadoLibre: "${mlStatus}"`, { 
           ml_id: existingProduct.ml_id, 
-          status: mlStatus 
+          status: mlStatus,
+          current_price: mlResponse.data?.price 
         }, jobId);
         
-        // Si el producto está publicado en ML, continuar con el proceso normal
-        // Esto permitirá actualizar precio, título y descripción más adelante
+        // ✅ REGLA CRÍTICA: Si está ACTIVO en ML, NO republicar - solo actualizar precio/título
+        if (mlStatus === 'active') {
+          await logStep("SKIP_REPUBLISH", `✅ Producto YA ACTIVO en ML - solo actualizando precio/título`, { 
+            ml_id: existingProduct.ml_id,
+            current_status: mlStatus
+          }, jobId);
+          // Continuar para actualizar precio/título más adelante
+        } else {
+          await logStep("ML_INACTIVE", `⚠️ Producto inactivo en ML (${mlStatus}) - evaluando republicación`, { 
+            ml_id: existingProduct.ml_id,
+            status: mlStatus
+          }, jobId);
+        }
+        
       } catch (mlError) {
         // Si hay error al verificar estado (404 o producto no encontrado)
         if (mlError.response?.status === 404) {
-          await logStep("ML", `Producto ya no existe en MercadoLibre: ${existingProduct.ml_id}`, null, jobId);
+          await logStep("ML_NOT_FOUND", `❌ Producto ya no existe en MercadoLibre: ${existingProduct.ml_id}`, null, jobId);
           // Marcar como que no existe para que se cree uno nuevo
           existingProduct.ml_id = null;
         } else {
@@ -279,10 +599,22 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
     
     // 5. Determinar precio CLP
     // Filtrar ofertas válidas con stock y ordenar por precio
+    await logStep("FILTERING_OFFERS", `🔍 Filtrando ofertas - Total disponibles: ${productData.offers?.length || 0}`, { 
+      totalOffers: productData.offers?.length || 0,
+      sampleOffers: productData.offers?.slice(0, 2) || []
+    }, jobId);
+    
     const validOffers = productData.offers.filter(offer => {
+      // Verificar que el objeto offer existe
+      if (!offer || typeof offer !== 'object') {
+        return false;
+      }
+      
       // Verificar precio
-      const hasValidPrice = typeof offer.price === 'number' && offer.price > 0;
-      if (!hasValidPrice) return false;
+      const hasValidPrice = typeof offer.price === 'number' && offer.price > 0 && !isNaN(offer.price);
+      if (!hasValidPrice) {
+        return false;
+      }
       
       // Verificar stock en cualquiera de sus posibles formatos
       const hasStock = (
@@ -295,7 +627,82 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       return hasValidPrice && hasStock;
     });
     
-    const lowestOffer = [...validOffers].sort((a, b) => a.price - b.price)[0];
+    await logStep("OFFERS_FILTERED", `📊 Resultado del filtrado: ${validOffers?.length || 0} ofertas válidas`, { 
+      validOffersCount: validOffers?.length || 0,
+      totalOriginal: productData.offers?.length || 0,
+      validOffersSample: validOffers?.slice(0, 2)?.map(offer => ({ 
+        price: offer.price, 
+        stock: offer.quantity || offer.qty || offer.quantityOffers || offer.stock 
+      })) || []
+    }, jobId);
+    
+    // ✅ VALIDACIÓN CRÍTICA: Verificar que hay ofertas válidas
+    if (!validOffers || validOffers.length === 0) {
+      await logDecision(
+        "[SKIP] RECHAZADO", 
+        "No se encontraron ofertas válidas con stock y precio", 
+        { 
+          totalOffers: productData.offers?.length || 0,
+          validOffers: 0,
+          sampleOffers: productData.offers?.slice(0, 3) || []
+        }, 
+        jobId
+      );
+      return {
+        kinguinId,
+        status: 'skipped',
+        reason: 'no_valid_offers',
+        message: "No se encontraron ofertas válidas con stock y precio"
+      };
+    }
+    
+    // ✅ PROTECCIÓN CRÍTICA: Crear copia del array y ordenar de forma segura
+    let lowestOffer;
+    try {
+      const offersCopy = Array.from(validOffers || []);
+      const sortedOffers = offersCopy.sort((offerA, offerB) => {
+        const priceA = (offerA && typeof offerA.price === 'number') ? offerA.price : 999999;
+        const priceB = (offerB && typeof offerB.price === 'number') ? offerB.price : 999999;
+        return priceA - priceB;
+      });
+      
+      lowestOffer = sortedOffers[0];
+      
+      await logStep("OFFER_SORT", `🔄 Ofertas ordenadas, seleccionando la más barata`, { 
+        totalOffers: offersCopy.length,
+        selectedPrice: lowestOffer?.price
+      }, jobId);
+      
+    } catch (sortError) {
+      await logStep("ERROR", `Error ordenando ofertas: ${sortError.message}`, { error: sortError }, jobId);
+      
+      return {
+        kinguinId,
+        status: 'error',
+        reason: 'offer_sort_error',
+        message: `Error ordenando ofertas: ${sortError.message}`
+      };
+    }
+    
+    // ✅ DOBLE VERIFICACIÓN: Asegurar que lowestOffer existe
+    if (!lowestOffer || typeof lowestOffer.price !== 'number' || lowestOffer.price <= 0) {
+      await logDecision(
+        "[SKIP] RECHAZADO", 
+        "Error al obtener la oferta más barata", 
+        { 
+          lowestOffer,
+          validOffersCount: validOffers.length
+        }, 
+        jobId
+      );
+      return {
+        kinguinId,
+        status: 'skipped',
+        reason: 'invalid_lowest_offer',
+        message: "Error al obtener la oferta más barata"
+      };
+    }
+    
     const { priceCLP, FX_EUR_CLP } = await computePriceCLP(lowestOffer.price);
     
     // Verificar si se pudo calcular un precio válido
@@ -316,22 +723,125 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
     
     await logStep("PRECIO", `Precio calculado: ${priceCLP} CLP (${lowestOffer.price} EUR, FX: ${FX_EUR_CLP})`, { price: priceCLP, eurPrice: lowestOffer.price }, jobId);
     
-    // Validar precio para MercadoLibre
+    // ✅ VALIDACIÓN ANTI-INFRACCIÓN: Precio para MercadoLibre
     if (!priceCLP || isNaN(priceCLP) || priceCLP < 100 || priceCLP > 50000000) {
-      throw new Error(`Precio inválido para MercadoLibre: ${priceCLP} CLP. Debe estar entre 100 y 50,000,000 CLP`);
+      await logDecision(
+        "[SKIP] PRECIO_INVALIDO", 
+        `Precio fuera del rango permitido por MercadoLibre: ${priceCLP} CLP`, 
+        { price: priceCLP, min: 100, max: 50000000 }, 
+        jobId
+      );
+      
+      duration = (Date.now() - startTime) / 1000;
+      return {
+        kinguinId,
+        status: 'skipped',
+        reason: 'invalid_price_range',
+        message: `Precio ${priceCLP} CLP fuera del rango permitido (100 - 50,000,000 CLP)`,
+        timeElapsed: `${duration}s`
+      };
     }
     
     // Asegurar que el precio sea un entero (MercadoLibre CLP no acepta decimales)
     priceCLP = Math.round(priceCLP);
     
+    // ✅ VALIDACIÓN ANTI-INFRACCIÓN: Verificar que el precio sea razonable para el mercado
+    const gameBasePriceUSD = lowestOffer.price * 0.9; // Aproximar EUR a USD
+    if (gameBasePriceUSD > 0.1 && gameBasePriceUSD < 200) { // Solo para juegos normales
+      const expectedPriceCLP = gameBasePriceUSD * 950; // ~$950 CLP por USD
+      const priceRatio = priceCLP / expectedPriceCLP;
+      
+      // Si el precio es 5x más alto o 50% más bajo que esperado, rechazar
+      if (priceRatio > 5.0 || priceRatio < 0.5) {
+        await logDecision(
+          "[SKIP] PRECIO_MERCADO", 
+          `Precio muy diferente al valor de mercado: ${priceCLP} CLP vs esperado ~${Math.round(expectedPriceCLP)} CLP (ratio: ${priceRatio.toFixed(2)}x)`, 
+          { 
+            calculated_price: priceCLP, 
+            expected_price: Math.round(expectedPriceCLP), 
+            ratio: priceRatio,
+            base_usd: gameBasePriceUSD 
+          }, 
+          jobId
+        );
+        
+        duration = (Date.now() - startTime) / 1000;
+        return {
+          kinguinId,
+          status: 'skipped',
+          reason: 'price_significantly_different',
+          message: `Precio ${priceCLP} CLP muy diferente al valor de mercado (~${Math.round(expectedPriceCLP)} CLP)`,
+          price_ratio: priceRatio,
+          timeElapsed: `${duration}s`
+        };
+      }
+    }
+    
+    // ✅ VALIDACIÓN ANTI-INFRACCIÓN: Verificar precio competitivo del mercado
+    const gameNameForSearch = (productData.originalName || productData.name || '').toLowerCase();
+    
+    // Solo verificar precios para juegos normales (no gift cards o cuentas)
+    if (!gameNameForSearch.includes('gift') && !gameNameForSearch.includes('account') && 
+        !gameNameForSearch.includes('wallet') && priceCLP > 1000) {
+      
+      await logStep("MARKET_VALIDATION", "Validando precio contra mercado chileno...", { 
+        price: priceCLP, 
+        game_name: gameNameForSearch 
+      }, jobId);
+      
+      try {
+        const marketValidation = await validateMarketPrice(gameNameForSearch, priceCLP);
+        
+        if (!marketValidation.isValid && marketValidation.reason === 'outside_market_range') {
+          await logDecision(
+            "[SKIP] PRECIO_MERCADO", 
+            `Precio significativamente diferente al mercado: ${priceCLP} CLP. Rango aceptable: ${marketValidation.marketStats.acceptableRange.min} - ${marketValidation.marketStats.acceptableRange.max} CLP`, 
+            { 
+              proposed_price: priceCLP,
+              market_stats: marketValidation.marketStats,
+              price_ratios: marketValidation.priceRatio,
+              sample_size: marketValidation.marketStats.sampleSize
+            }, 
+            jobId
+          );
+          
+          duration = (Date.now() - startTime) / 1000;
+          return {
+            kinguinId,
+            status: 'skipped',
+            reason: 'price_significantly_different_market',
+            message: `Precio ${priceCLP} CLP fuera del rango de mercado (${marketValidation.marketStats.acceptableRange.min} - ${marketValidation.marketStats.acceptableRange.max} CLP)`,
+            market_validation: marketValidation,
+            timeElapsed: `${duration}s`
+          };
+        }
+        
+        await logStep("MARKET_VALIDATION", `✅ Precio validado contra mercado`, { 
+          validation_result: marketValidation.reason,
+          market_range: marketValidation.marketStats?.acceptableRange
+        }, jobId);
+        
+      } catch (validationError) {
+        // Si falla la validación de mercado, continuar pero registrar advertencia
+        await logStep("WARNING", `No se pudo validar precio de mercado: ${validationError.message}`, { 
+          error: validationError.message 
+        }, jobId);
+      }
+    }
+    
     // 6. Preparar datos para ML
     const productType = getProductType(productData);
     const rawTitle = titleFrom(productData, productType);
     
-    // Validar y limpiar el título para MercadoLibre
+    // ✅ VALIDACIÓN ANTI-INFRACCIÓN: Limpiar título para MercadoLibre
     let title = rawTitle
       .replace(/[^\w\s\-|áéíóúñÁÉÍÓÚÑ]/g, '') // Solo caracteres seguros
       .replace(/\s+/g, ' ') // Limpiar espacios múltiples
+      .replace(/\$[\d,\.]+/g, '') // ✅ REMOVER precios específicos del título
+      .replace(/precio\s*mínimo/gi, '') // ✅ REMOVER "precio mínimo"
+      .replace(/desde\s*\$/gi, '') // ✅ REMOVER "desde $"
+      .replace(/por\s*\$/gi, '') // ✅ REMOVER "por $"
+      .replace(/\s+/g, ' ') // Limpiar espacios múltiples nuevamente
       .trim();
     
     // Verificar longitud (MercadoLibre máximo 60 caracteres)
@@ -339,16 +849,48 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       title = title.substring(0, 57) + '...';
     }
     
-    // Verificar que no esté vacío
+    // ✅ VALIDACIÓN ANTI-INFRACCIÓN: Verificar que el título no contenga precios
+    const containsPrice = /\$[\d,\.]+|precio|mínimo|desde|por\s*\$/.test(title.toLowerCase());
+    if (containsPrice) {
+      await logStep("WARNING", `Título contiene referencias de precio, limpiando: "${title}"`, { original_title: rawTitle }, jobId);
+      // Limpiar más agresivamente si aún contiene precios
+      title = title
+        .replace(/precio/gi, '')
+        .replace(/mínimo/gi, '')
+        .replace(/desde/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+    
+    // Verificar que no esté vacío o muy corto
     if (!title || title.length < 10) {
-      throw new Error(`Título inválido o muy corto: "${title}"`);
+      await logDecision(
+        "[SKIP] TITULO_INVALIDO", 
+        `Título inválido o muy corto después de limpieza: "${title}"`, 
+        { original_title: rawTitle, cleaned_title: title }, 
+        jobId
+      );
+      
+      duration = (Date.now() - startTime) / 1000;
+      return {
+        kinguinId,
+        status: 'skipped',
+        reason: 'invalid_title',
+        message: `Título inválido: "${title}"`,
+        timeElapsed: `${duration}s`
+      };
     }
     const platform = normalizePlatform(productData.platform);
     const description = descriptionFrom(productData, productType);
     
-    // 7. Publicar o actualizar en MercadoLibre
-    // Si ya existe, verificar si necesita actualización
+    // 7. ✅ LÓGICA CRÍTICA: Publicar o actualizar SOLO si está activo en MercadoLibre
+    // Si ya existe en Supabase, verificar si necesita actualización
     if (existingProduct && existingProduct.ml_id) {
+      await logStep("UPDATE_CHECK", `🔄 Verificando si necesita actualización: ML ID ${existingProduct.ml_id}`, { 
+        ml_id: existingProduct.ml_id,
+        kinguin_id: kinguinId
+      }, jobId);
+      
       // Obtener información actual del producto en MercadoLibre para comparar
       let needsUpdate = false;
       let currentMLProduct = null;
@@ -364,6 +906,39 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
         );
         currentMLProduct = mlProduct;
         
+        // ✅ REGLA CRÍTICA: Solo actualizar si el producto está ACTIVO en MercadoLibre
+        if (mlProduct.status !== 'active') {
+          await logDecision(
+            "[SKIP] NO_ACTIVO", 
+            `Producto no está activo en ML (${mlProduct.status}) - no se actualiza`, 
+            { 
+              ml_id: existingProduct.ml_id, 
+              current_status: mlProduct.status,
+              kinguin_id: kinguinId
+            }, 
+            jobId
+          );
+          
+          duration = (Date.now() - startTime) / 1000;
+          return {
+            kinguinId,
+            status: 'skipped',
+            reason: 'not_active_in_ml',
+            message: `Producto no activo en ML (${mlProduct.status})`,
+            ml_id: existingProduct.ml_id,
+            ml_status: mlProduct.status,
+            timeElapsed: `${duration}s`
+          };
+        }
+        
+        await logStep("ACTIVE_CHECK", `✅ Producto ACTIVO en ML - verificando necesidad de actualización`, { 
+          ml_id: existingProduct.ml_id,
+          current_price: mlProduct.price,
+          calculated_price: priceCLP,
+          current_title: mlProduct.title,
+          calculated_title: title
+        }, jobId);
+        
         // Verificar si el precio necesita actualización (tolerancia reducida a 5 CLP)
         if (Math.abs(mlProduct.price - priceCLP) > 5) { // Tolerancia más estricta
           needsUpdate = true;
@@ -376,29 +951,8 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
           updatedFields.push(`título: "${mlProduct.title}" → "${title}"`);
         }
         
-        // Verificar si la descripción necesita actualización
-        try {
-          const { data: currentDescription } = await axiosWithSmartRetry(
-            `https://api.mercadolibre.com/items/${existingProduct.ml_id}/description`,
-            null,
-            {
-              method: 'get',
-              headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` }
-            }
-          );
-          
-          const currentDesc = currentDescription.plain_text || "";
-          const expectedDesc = description.trim();
-          
-          if (currentDesc.trim() !== expectedDesc) {
-            needsUpdate = true;
-            updatedFields.push(`descripción actualizada`);
-          }
-        } catch (descError) {
-          // Si no se puede obtener la descripción, asumimos que necesita actualización
-          needsUpdate = true;
-          updatedFields.push(`descripción (error al verificar)`);
-        }
+        // ✅ REGLA CRÍTICA: Solo actualizar precio y título - NO descripción innecesaria
+        // (Cumpliendo instrucción del usuario de no tocar descripción si no es necesario)
         
       } catch (error) {
         await logStep("ERROR", `Error al verificar producto en ML: ${error.message}`, { error: error.message }, jobId);
@@ -452,7 +1006,14 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       }
       
       try {
-        // Actualizar precio y título en ML
+        // ✅ REGLA CRÍTICA: Solo actualizar precio y título - NO descripción
+        await logStep("UPDATE_PRICE_TITLE", `🔄 Actualizando SOLO precio y título en ML`, { 
+          ml_id: existingProduct.ml_id,
+          new_price: priceCLP,
+          new_title: title,
+          updated_fields: updatedFields
+        }, jobId);
+        
         await axiosWithSmartRetry(
           `https://api.mercadolibre.com/items/${existingProduct.ml_id}`,
           { 
@@ -465,14 +1026,14 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
           }
         );
         
-        // Actualizar descripción en ML
-        await postPlainDescription(existingProduct.ml_id, description, ML_ACCESS_TOKEN, productData);
+        // ✅ PROHIBIDO: NO actualizar descripción automáticamente
+        // await postPlainDescription(existingProduct.ml_id, description, ML_ACCESS_TOKEN, productData);
         
         const updateMessage = updatedFields.length > 0 
-          ? `Producto actualizado en ML: ${updatedFields.join(', ')}` 
-          : `Producto actualizado en ML con ID: ${existingProduct.ml_id}`;
+          ? `✅ Producto actualizado en ML: ${updatedFields.join(', ')}` 
+          : `✅ Producto actualizado en ML con ID: ${existingProduct.ml_id}`;
           
-        await logDecision("APROBADO", updateMessage, { 
+        await logDecision("ACTUALIZADO", updateMessage, { 
           ml_id: existingProduct.ml_id, 
           price: priceCLP,
           title: title,
@@ -670,20 +1231,28 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       await postPlainDescription(createdItem.id, description, ML_ACCESS_TOKEN, productData);
       await logStep("DESCRIPCION", "Descripción actualizada", null, jobId);
       
-      // Guardar relación en Supabase
-      await supabase.from("published_products").insert({
-        kinguin_id: kinguinId,
-        ml_id: createdItem.id,
-        price: priceCLP,
-        euro_price: lowestOffer.price,
-        title,
-        platform,
-        product_type: productType,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        region: normalizedRegion,
-        status: "active"
-      });
+      // ✅ ACTUALIZAR el registro de "processing" con la información completa
+      const { error: updateError } = await supabase
+        .from("published_products")
+        .update({
+          ml_id: createdItem.id,
+          price: priceCLP,
+          euro_price: lowestOffer.price,
+          title,
+          platform,
+          product_type: productType,
+          updated_at: new Date().toISOString(),
+          region: normalizedRegion,
+          status: "active"
+        })
+        .eq("kinguin_id", kinguinId)
+        .eq("status", "processing");
+        
+      if (updateError) {
+        await logStep("ERROR", `Error actualizando registro en Supabase: ${updateError.message}`, { error: updateError }, jobId);
+      } else {
+        await logStep("SUPABASE_UPDATE", "Registro actualizado en Supabase exitosamente", { ml_id: createdItem.id }, jobId);
+      }
       
       await logDecision("APROBADO", `Nuevo producto publicado en ML con ID: ${createdItem.id}`, { ml_id: createdItem.id, price: priceCLP }, jobId);
       
@@ -784,10 +1353,10 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
         if (errorDetails.cause) {
           if (Array.isArray(errorDetails.cause)) {
             // Múltiples errores
-            specificCause = errorDetails.cause.map(c => 
-              typeof c === 'object' ? 
-                `${c.code}: ${c.message}` : 
-                c.toString()
+            specificCause = errorDetails.cause.map(causeItem => 
+              typeof causeItem === 'object' ? 
+                `${causeItem.code}: ${causeItem.message}` : 
+                causeItem.toString()
             ).join(' | ');
           } else if (typeof errorDetails.cause === 'object') {
             // Un solo error estructurado
@@ -840,6 +1409,20 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       const errorMessage = (typeof error.response?.data === 'object' && error.response.data !== null)
         ? error.response.data.message || JSON.stringify(error.response.data)
         : (error.response?.data || error.message);
+
+      // 🧹 LIMPIAR registro de "processing" si hay error
+      try {
+        await supabase
+          .from("published_products")
+          .delete()
+          .eq("kinguin_id", kinguinId)
+          .eq("status", "processing")
+          .is("ml_id", null);
+          
+        await logStep("CLEANUP", `Registro de processing eliminado para Kinguin ID: ${kinguinId}`, { kinguin_id: kinguinId }, jobId);
+      } catch (cleanupError) {
+        await logStep("ERROR", `Error limpiando registro de processing: ${cleanupError.message}`, { error: cleanupError }, jobId);
+      }
 
       return { 
         kinguinId, 
@@ -972,7 +1555,7 @@ async function runProductProcessingJob(jobId, kinguinIds) {
         }
       }
       
-      const existingProductMap = new Map(existingProductsInChunk.map(p => [String(p.kinguin_id), p]));
+      const existingProductMap = new Map(existingProductsInChunk.map(product => [String(product.kinguin_id), product]));
 
       // Procesar con nuestro sistema inteligente de lotes
       console.log(`🔄 [Job ID: ${jobId}] Procesando lote ${currentBatch} con sistema optimizado de concurrencia`);
@@ -1032,7 +1615,7 @@ async function runProductProcessingJob(jobId, kinguinIds) {
       await logActivity(`Lote ${currentBatch} completado: ${chunk.length} productos procesados`, 'info', null, jobId);
       
       // Mapear resultados para formato consistente
-      const results = batchResults.map(r => r.success ? r.data : r.error);
+      const results = batchResults.map(result => result.success ? result.data : result.error);
       
       allResults.push(...results);
 
@@ -1049,8 +1632,8 @@ async function runProductProcessingJob(jobId, kinguinIds) {
           processed: allResults.length,
           total: kinguinIds.length,
           avgSpeed: processingSpeed,
-          success: allResults.filter(r => r.status === 'success').length,
-          failed: allResults.filter(r => r.status !== 'success').length
+          success: allResults.filter(result => result.status === 'success').length,
+          failed: allResults.filter(result => result.status !== 'success').length
         },
         jobId
       );

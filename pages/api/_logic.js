@@ -3,7 +3,6 @@ import axios from "axios";
 // ---------- Registro de actividad ----------
 export async function logActivity(message, type = 'info', details = null, jobId = null) {
   try {
-    // Llamada interna a la API de activity-logs
     const timestamp = new Date().toISOString();
     
     // Si estamos en un entorno serverless o SSR:
@@ -12,7 +11,7 @@ export async function logActivity(message, type = 'info', details = null, jobId 
       const { createClient } = await import("@supabase/supabase-js");
       const supabase = createClient(
         process.env.SUPABASE_URL,
-        process.env.SUPABASE_SERVICE_ROLE_KEY
+        process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY
       );
       
       // Registrar directamente en la base de datos
@@ -24,19 +23,9 @@ export async function logActivity(message, type = 'info', details = null, jobId 
         timestamp
       });
       
-      // También registrar en la consola para debugging
-      const typeEmoji = {
-        'info': 'ℹ️',
-        'success': '✅',
-        'error': '❌',
-        'warning': '⚠️'
-      };
-      console.log(`${typeEmoji[type] || '🔸'} [${type.toUpperCase()}]${jobId ? ` [Job: ${jobId}]` : ''} ${message}`);
-      
-      return { success: true, timestamp };
-    }
-    // En entorno cliente, usar la API
-    else {
+      console.log(`[${type.toUpperCase()}] ${message}`, details || '');
+    } else {
+      // En entorno cliente, usar la API
       const response = await fetch('/api/activity-logs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -45,15 +34,23 @@ export async function logActivity(message, type = 'info', details = null, jobId 
       
       if (!response.ok) {
         console.error('Error al registrar actividad:', await response.text());
-        return { success: false, error: 'Error al registrar actividad' };
       }
-      
-      return await response.json();
     }
-  } catch (err) {
-    console.error('Error al registrar actividad:', err);
-    return { success: false, error: err.message };
+  } catch (error) {
+    console.error('[logActivity] Error:', error.message);
   }
+}
+
+// ✅ ALIAS para compatibilidad con nuevo código
+export async function logStep(step, message, details = null, jobId = null) {
+  return logActivity(`[${step}] ${message}`, 'info', details, jobId);
+}
+
+// ✅ FUNCIÓN para decisiones críticas
+export async function logDecision(decision, message, details = null, jobId = null) {
+  const isError = decision.includes('ERROR') || decision.includes('SKIP');
+  const type = isError ? 'warning' : 'success';
+  return logActivity(`[${decision}] ${message}`, type, details, jobId);
 }
 
 // ---------- Plataforma ----------
@@ -428,10 +425,12 @@ export function descriptionFrom(product, productType) {
   const soporte = "Soporte en español durante todo el proceso. Garantía real: si tienes un problema, te ayudamos.";
   const confianza = "Compra segura y atención personalizada. Experiencia comprobada.";
   const urgencia = "¡OFERTA POR TIEMPO LIMITADO! No te pierdas esta oportunidad.";
+  
+  // ✅ PROTECCIÓN ANTI-INFRACCIÓN: FAQ sin menciones de precios
   const faq = `
 PREGUNTAS FRECUENTES:
 ¿Necesito tarjeta de crédito internacional? NO, solo pagas por MercadoLibre.
-¿Hay costos ocultos o adicionales? NO, pagas exactamente el precio publicado.
+¿Hay costos adicionales? NO, pagas exactamente lo que indica el precio de la publicación.
 ¿Cuánto tarda la entrega? Durante el horario de atención, una vez confirmado el pago.
 ¿Es confiable? SÍ, ofrecemos soporte garantizado y atención personalizada.`;
   let descripcion = "";
@@ -537,12 +536,12 @@ PREGUNTAS FRECUENTES:
       `${faq}\n\n` +
       `Importante: Una vez entregado el código no hay devoluciones, salvo código defectuoso.`;
   }
-  return sanitizeDescriptionForML(descripcion);
+  return sanitizeDescriptionBasic(descripcion);
 }
 
 // ---------- Lógica de Descripción para ML ----------
 
-function sanitizeDescriptionForML(text) {
+function sanitizeDescriptionBasic(text) {
   if (!text) return "";
   let s = String(text);
   s = s.replace(/[\uD800-\uDFFF]/g, ""); // Quitar emojis / surrogate pairs
@@ -578,7 +577,7 @@ export async function postPlainDescription(mlId, rawDescription, token, product)
   const URL = `https://api.mercadolibre.com/items/${mlId}/description`;
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
 
-  let desc = sanitizeDescriptionForML(rawDescription);
+  let desc = sanitizeDescriptionBasic(rawDescription);
   if (!desc) desc = buildSafeFallbackDescription(product);
 
   await axios.put(URL, { plain_text: desc }, { headers, timeout: 20000 });
@@ -588,6 +587,92 @@ export async function postPlainDescription(mlId, rawDescription, token, product)
 
 // Variable para importación dinámica con soporte lazy loading
 let axiosWithSmartRetry = null;
+
+// ✅ FUNCIÓN ANTI-INFRACCIÓN: Limpiar descripción de contenido prohibido por MercadoLibre
+export function sanitizeDescriptionForML(description) {
+  if (!description || typeof description !== 'string') {
+    return description;
+  }
+  
+  // Primero aplicar sanitización básica
+  let cleanDescription = sanitizeDescriptionBasic(description);
+  
+  // 🚫 PROTECCIÓN 1: Remover menciones de "precio mínimo" (PROHIBIDO por ML)
+  const precioMinimoPatterns = [
+    /precio\s*mínimo/gi,
+    /compra\s*mínima/gi,
+    /monto\s*mínimo/gi,
+    /valor\s*mínimo/gi,
+    /desde\s*\$[\d,\.]+/gi,
+    /a\s*partir\s*de\s*\$[\d,\.]+/gi
+  ];
+  
+  precioMinimoPatterns.forEach(pattern => {
+    cleanDescription = cleanDescription.replace(pattern, '');
+  });
+  
+  // 🚫 PROTECCIÓN 2: PROHIBIDO - Remover referencias específicas a precios en CLP (evitar precio distinto al header)
+  const precioSpecificoPatterns = [
+    /\$[\d,\.]+\s*CLP/gi,
+    /[\d,\.]+\s*pesos/gi,
+    /cuesta\s*\$[\d,\.]+/gi,
+    /vale\s*\$[\d,\.]+/gi,
+    /por\s*\$[\d,\.]+/gi,
+    /precio\s*\$[\d,\.]+/gi,
+    /\$[\d,\.]+(?!\s*hrs)/gi // Remover precios pero mantener horarios como "23:00 hrs"
+  ];
+  
+  precioSpecificoPatterns.forEach(pattern => {
+    cleanDescription = cleanDescription.replace(pattern, '');
+  });
+  
+  // 🚫 PROTECCIÓN 3: PROHIBIDO - Remover unidades de medida (peso, volumen, longitud)
+  const unidadesMedidaPatterns = [
+    /por\s*gramo/gi,
+    /por\s*kilo/gi,
+    /por\s*litro/gi,
+    /por\s*metro/gi,
+    /por\s*kg/gi,
+    /por\s*gr/gi,
+    /por\s*ml/gi,
+    /por\s*cm/gi,
+    /por\s*mm/gi,
+    /[\d,\.]+\s*(kg|gr|ml|lt|cm|mm|metros?|gramos?|kilos?|litros?)/gi
+  ];
+  
+  unidadesMedidaPatterns.forEach(pattern => {
+    cleanDescription = cleanDescription.replace(pattern, '');
+  });
+  
+  // 🚫 PROTECCIÓN 4: PROHIBIDO - Remover LINKS, EMAILS y dominios web
+  const linkEmailPatterns = [
+    /https?:\/\/[^\s]+/gi, // URLs completas
+    /www\.[^\s]+/gi, // www.ejemplo.com
+    /[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/gi, // dominios.com
+    /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/gi, // emails
+    /whatsapp/gi,
+    /telegram/gi,
+    /discord/gi,
+    /contacto/gi
+  ];
+  
+  linkEmailPatterns.forEach(pattern => {
+    cleanDescription = cleanDescription.replace(pattern, '');
+  });
+  
+  // 🚫 PROTECCIÓN 5: PROHIBIDO - Remover EMOJIS (todos los caracteres Unicode emoji)
+  const emojiPattern = /[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F700}-\u{1F77F}]|[\u{1F780}-\u{1F7FF}]|[\u{1F800}-\u{1F8FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]|[\u{1F900}-\u{1F9FF}]|[\u{1F1E0}-\u{1F1FF}]/gu;
+  cleanDescription = cleanDescription.replace(emojiPattern, '');
+  
+  // 🧹 Limpiar espacios múltiples y saltos de línea extra
+  cleanDescription = cleanDescription
+    .replace(/\s{3,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\s*\n\s*/g, '\n') // Limpiar saltos con espacios
+    .trim();
+  
+  return cleanDescription;
+}
 
 export async function getKinguinProduct(kinguinId, { KINGUIN_API_KEY }) {
   const kinguinIdStr = String(kinguinId);
