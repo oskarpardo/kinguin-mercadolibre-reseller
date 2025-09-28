@@ -41,6 +41,103 @@ async function checkMercadoLibre() {
 }
 
 export default async function handler(req, res) {
+  // Análisis de duplicados en public.published_products
+  if (req.query.analyze === 'duplicates') {
+    try {
+      console.log('🔍 Analizando duplicados en public.published_products...');
+
+      // 1. Estadísticas generales
+      const { count: totalProducts, error: countError } = await supabase
+        .from('published_products')
+        .select('*', { count: 'exact', head: true });
+
+      if (countError) throw countError;
+
+      // 2. Obtener todos los kinguin_id para análisis
+      const { data: allProducts, error: fetchError } = await supabase
+        .from('published_products')
+        .select('kinguin_id, ml_id, created_at, title')
+        .order('kinguin_id');
+
+      if (fetchError) throw fetchError;
+
+      console.log(`📊 Total productos obtenidos: ${allProducts.length}`);
+
+      // 3. Análisis de duplicados por kinguin_id
+      const kinguinGroups = new Map();
+      
+      allProducts.forEach(product => {
+        const kinguinId = String(product.kinguin_id);
+        
+        if (!kinguinGroups.has(kinguinId)) {
+          kinguinGroups.set(kinguinId, []);
+        }
+        
+        kinguinGroups.get(kinguinId).push({
+          ml_id: product.ml_id,
+          created_at: product.created_at,
+          title: product.title?.slice(0, 50) + '...' || 'Sin título'
+        });
+      });
+
+      // 4. Encontrar duplicados
+      const duplicateGroups = [];
+      let totalDuplicateRecords = 0;
+
+      for (const [kinguinId, products] of kinguinGroups.entries()) {
+        if (products.length > 1) {
+          duplicateGroups.push({
+            kinguin_id: kinguinId,
+            duplicate_count: products.length,
+            products: products
+          });
+          totalDuplicateRecords += products.length;
+        }
+      }
+
+      const uniqueKinguinIds = kinguinGroups.size;
+      const wastedRecords = totalDuplicateRecords - duplicateGroups.length;
+
+      console.log(`🔍 Análisis completado:`);
+      console.log(`  - Total productos: ${totalProducts}`);
+      console.log(`  - Kinguin IDs únicos: ${uniqueKinguinIds}`);
+      console.log(`  - Grupos duplicados: ${duplicateGroups.length}`);
+      console.log(`  - Registros desperdiciados: ${wastedRecords}`);
+
+      return res.status(200).json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        analysis: 'duplicates_check',
+        database_table: 'public.published_products',
+        stats: {
+          total_products: totalProducts,
+          unique_kinguin_ids: uniqueKinguinIds,
+          duplicate_groups_found: duplicateGroups.length,
+          total_duplicate_records: totalDuplicateRecords,
+          wasted_records: wastedRecords,
+          efficiency_percentage: ((uniqueKinguinIds / totalProducts) * 100).toFixed(2) + '%',
+          waste_percentage: ((wastedRecords / totalProducts) * 100).toFixed(2) + '%'
+        },
+        duplicates_sample: duplicateGroups.slice(0, 10).map(group => ({
+          kinguin_id: group.kinguin_id,
+          duplicate_count: group.duplicate_count,
+          sample_products: group.products.slice(0, 3)
+        })),
+        summary: duplicateGroups.length > 0 
+          ? `¡DUPLICADOS DETECTADOS! ${duplicateGroups.length} grupos con ${wastedRecords} registros desperdiciados`
+          : 'NO HAY DUPLICADOS - Catálogo optimizado'
+      });
+
+    } catch (error) {
+      console.error('❌ Error en análisis de duplicados:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message,
+        analysis: 'duplicates_check'
+      });
+    }
+  }
+
   // Si hay un parámetro test, hacer una prueba del error de inicialización
   if (req.query.test === 'initialization') {
     try {
