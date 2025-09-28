@@ -31,6 +31,141 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ---------- Verificación de SKU duplicado en MercadoLibre ----------
+async function checkSkuDuplicateInMercadoLibre(sku, ML_ACCESS_TOKEN, jobId = null) {
+  try {
+    // Obtener info del usuario
+    const userResponse = await axiosWithSmartRetry(
+      'https://api.mercadolibre.com/users/me',
+      null,
+      {
+        method: 'get',
+        headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` }
+      }
+    );
+
+    const userId = userResponse.data.id;
+
+    // Buscar productos activos del usuario con más productos
+    let allItems = [];
+    let offset = 0;
+    const limit = 50;
+    
+    // Obtener hasta 200 productos activos para verificar duplicados
+    for (let page = 0; page < 4; page++) {
+      const itemsResponse = await axiosWithSmartRetry(
+        `https://api.mercadolibre.com/users/${userId}/items/search?status=active&offset=${offset}&limit=${limit}`,
+        null,
+        {
+          method: 'get',
+          headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` }
+        }
+      );
+
+      const items = itemsResponse.data.results || [];
+      if (items.length === 0) break;
+      
+      allItems = allItems.concat(items);
+      offset += limit;
+      
+      if (allItems.length >= itemsResponse.data.paging.total) break;
+    }
+    
+    await logStep("SKU_CHECK_SCOPE", `🔍 Verificando SKU en ${allItems.length} productos activos`, { 
+      sku, 
+      products_to_check: allItems.length 
+    }, jobId);
+    
+    // Verificar productos en lotes para mayor eficiencia
+    const batchSize = 10;
+    
+    for (let i = 0; i < allItems.length; i += batchSize) {
+      const batch = allItems.slice(i, i + batchSize);
+      
+      const batchPromises = batch.map(async (itemId) => {
+        try {
+          const itemResponse = await axiosWithSmartRetry(
+            `https://api.mercadolibre.com/items/${itemId}`,
+            null,
+            {
+              method: 'get',
+              headers: { 'Authorization': `Bearer ${ML_ACCESS_TOKEN}` }
+            }
+          );
+
+          const item = itemResponse.data;
+          
+          // Extraer SKU del atributo SELLER_SKU
+          const skuAttribute = item.attributes?.find(attr => attr.id === 'SELLER_SKU');
+          const existingSku = skuAttribute?.value_name;
+
+          if (existingSku === sku) {
+            return {
+              isDuplicate: true,
+              existingItem: {
+                ml_id: itemId,
+                title: item.title,
+                sku: existingSku,
+                status: item.status,
+                price: item.price
+              }
+            };
+          }
+          
+          return { isDuplicate: false };
+          
+        } catch (itemError) {
+          console.warn(`⚠️ Error verificando item ${itemId}:`, itemError.message);
+          return { isDuplicate: false, error: itemError.message };
+        }
+      });
+      
+      const batchResults = await Promise.all(batchPromises);
+      
+      // Verificar si alguno es duplicado
+      for (const result of batchResults) {
+        if (result.isDuplicate) {
+          await logStep("SKU_DUPLICATE_FOUND", `🚫 SKU DUPLICADO ENCONTRADO en MercadoLibre`, {
+            duplicate_sku: sku,
+            existing_ml_id: result.existingItem.ml_id,
+            existing_title: result.existingItem.title,
+            existing_status: result.existingItem.status
+          }, jobId);
+
+          return result;
+        }
+      }
+      
+      // Rate limiting entre lotes
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    await logStep("SKU_CHECK_PASSED", `✅ SKU único verificado: ${sku}`, { 
+      sku, 
+      products_checked: allItems.length 
+    }, jobId);
+    
+    return {
+      isDuplicate: false,
+      existingItem: null
+    };
+
+  } catch (error) {
+    await logStep("SKU_CHECK_ERROR", `❌ Error verificando SKU: ${error.message}`, { 
+      sku, 
+      error: error.message 
+    }, jobId);
+    
+    // En caso de error, permitir continuar (no bloquear por problemas de verificación)
+    console.warn(`⚠️ Error verificando SKU duplicado: ${error.message}`);
+    return {
+      isDuplicate: false,
+      existingItem: null,
+      error: error.message
+    };
+  }
+}
+
 // ---------- Tokens desde Supabase (con fallback a ENV) ----------
 async function getTokenFromSupabase(key) {
   try {
@@ -1215,6 +1350,40 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
         condition: mlItemData.condition,
         listing_type_id: mlItemData.listing_type_id
       }, jobId);
+      
+      // ✅ VERIFICACIÓN CRÍTICA: Comprobar duplicados por SKU en MercadoLibre ANTES de publicar
+      await logStep("SKU_VERIFICATION", `🔍 Verificando SKU duplicado: ${kinguinId}`, { sku: kinguinId }, jobId);
+      
+      const skuCheck = await checkSkuDuplicateInMercadoLibre(kinguinId.toString(), ML_ACCESS_TOKEN, jobId);
+      
+      if (skuCheck.isDuplicate) {
+        await logDecision("SKU_DUPLICATE_REJECTED", `🚫 PRODUCTO RECHAZADO - SKU ya existe en MercadoLibre`, {
+          kinguin_id: kinguinId,
+          duplicate_sku: kinguinId,
+          existing_ml_id: skuCheck.existingItem.ml_id,
+          existing_title: skuCheck.existingItem.title,
+          existing_price: skuCheck.existingItem.price
+        }, jobId);
+
+        // Limpiar registro de procesamiento
+        await supabase
+          .from("published_products")
+          .delete()
+          .eq("kinguin_id", kinguinId)
+          .eq("status", "processing")
+          .is("ml_id", null);
+
+        return {
+          kinguinId,
+          status: 'skipped',
+          reason: 'sku_duplicate_in_mercadolibre',
+          message: `SKU ${kinguinId} ya existe en MercadoLibre (ML ID: ${skuCheck.existingItem.ml_id})`,
+          existing_item: skuCheck.existingItem,
+          success: false
+        };
+      }
+      
+      await logStep("SKU_UNIQUE", `✅ SKU único confirmado, procediendo con publicación`, { sku: kinguinId }, jobId);
       
       // Crear el item en ML
       const { data: createdItem } = await axiosWithSmartRetry(
