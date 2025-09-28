@@ -54,6 +54,7 @@ export default async function handler(req, res) {
       status: 'ok',
       timestamp: new Date().toISOString(),
       checks,
+      version: '1.1.0'
     });
   } else {
     console.error("🚨 Health Check fallido:", checks);
@@ -61,6 +62,7 @@ export default async function handler(req, res) {
       status: 'error',
       timestamp: new Date().toISOString(),
       checks,
+      version: '1.1.0'
     });
   }
 }
