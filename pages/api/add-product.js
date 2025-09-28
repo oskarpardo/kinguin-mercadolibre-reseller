@@ -1124,6 +1124,7 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
         buying_mode: "buy_it_now",
         listing_type_id: "gold_pro", // Requiere imágenes pero las extraemos de Kinguin
         condition: "new",
+        seller_custom_field: String(kinguinId), // 🔑 SKU CRÍTICO para detección de duplicados
         attributes: [
           {
             id: "COLLECTION",
