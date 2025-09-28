@@ -191,36 +191,111 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
   try {
     await logStep("INICIO", `Procesando producto Kinguin ID: ${kinguinId}`, { existingProduct }, jobId);
     
-    // 🚫 PASO 1: VERIFICACIÓN CRÍTICA DE SKU EN MERCADOLIBRE (ANTES de crear nada en Supabase)
-    await logStep("SKU_VERIFICATION_FIRST", `🔍 VERIFICACIÓN CRÍTICA SKU - Verificando SKU ${kinguinId} en MercadoLibre ANTES de crear registro`, { 
+    // � PASO 1: VERIFICACIÓN CRÍTICA EN SUPABASE - Verificar si Kinguin ID ya existe
+    await logStep("SUPABASE_CHECK_FIRST", `🔍 PASO 1: Verificando si Kinguin ID ${kinguinId} ya existe en Supabase`, { 
       kinguin_id: kinguinId 
     }, jobId);
     
-    const skuCheck = await checkSkuDuplicateInMercadoLibre(kinguinId.toString(), ML_ACCESS_TOKEN, jobId);
-    
-    if (skuCheck.isDuplicate) {
-      await logDecision("SKU_DUPLICATE_EARLY_REJECTION", `🚫 PRODUCTO RECHAZADO - SKU ya existe en MercadoLibre (NO se creará registro en Supabase)`, {
+    const { data: existingInSupabase, error: supabaseCheckError } = await supabase
+      .from("published_products")
+      .select("*")
+      .eq("kinguin_id", kinguinId)
+      .neq("status", "closed_duplicate");
+      
+    if (supabaseCheckError) {
+      await logStep("SUPABASE_CHECK_ERROR", `Error verificando Supabase: ${supabaseCheckError.message}`, { error: supabaseCheckError }, jobId);
+    }
+
+    if (existingInSupabase && existingInSupabase.length > 0) {
+      await logDecision("SUPABASE_DUPLICATE_REJECTION", `🚫 CASO 2: PRODUCTO RECHAZADO - Kinguin ID ${kinguinId} ya existe en Supabase`, {
         kinguin_id: kinguinId,
-        duplicate_sku: kinguinId,
-        existing_ml_id: skuCheck.existingItem.ml_id,
-        existing_title: skuCheck.existingItem.title,
-        existing_price: skuCheck.existingItem.price
+        existing_records: existingInSupabase.length,
+        existing_data: existingInSupabase.map(item => ({
+          id: item.id,
+          ml_id: item.ml_id,
+          status: item.status,
+          created_at: item.created_at
+        }))
       }, jobId);
 
       return {
         kinguinId,
         status: 'skipped',
-        reason: 'sku_duplicate_in_mercadolibre_early_check',
-        message: `SKU ${kinguinId} ya existe en MercadoLibre (ML ID: ${skuCheck.existingItem.ml_id}) - No se creó registro en Supabase`,
-        existing_item: skuCheck.existingItem,
+        reason: 'kinguin_id_exists_in_supabase',
+        message: `Kinguin ID ${kinguinId} ya existe en Supabase`,
+        existing_records: existingInSupabase.length,
         success: false
       };
     }
     
-    await logStep("SKU_UNIQUE_CONFIRMED", `✅ SKU único confirmado, procediendo con creación en Supabase`, { sku: kinguinId }, jobId);
+    await logStep("SUPABASE_CHECK_PASSED", `✅ PASO 1 OK: Kinguin ID ${kinguinId} no existe en Supabase`, { kinguin_id: kinguinId }, jobId);
     
-    // 🚫 PASO 2: VERIFICACIÓN CRÍTICA TEMPRANA EN SUPABASE: Detener INMEDIATAMENTE si ya existe
-    await logStep("VERIFICACION_TEMPRANA", `🔍 VERIFICACIÓN CRÍTICA - Buscando duplicados para Kinguin ID: ${kinguinId}`, { kinguin_id: kinguinId }, jobId);
+    // 🌍 PASO 2: OBTENER DATOS DE KINGUIN Y VERIFICAR REGIÓN
+    await logStep("KINGUIN_DATA_FETCH", `🔍 PASO 2: Obteniendo datos de Kinguin para verificar región`, { kinguin_id: kinguinId }, jobId);
+    
+    let productData;
+    try {
+      const kinguinTimeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout: Kinguin API tomó más de 15 segundos')), 15000)
+      );
+      
+      const kinguinPromise = getKinguinProduct(kinguinId, { KINGUIN_API_KEY });
+      productData = await Promise.race([kinguinPromise, kinguinTimeoutPromise]);
+      
+      await logStep("KINGUIN_DATA_SUCCESS", "Datos obtenidos de Kinguin API", { 
+        name: productData.name, 
+        platform: productData.platform, 
+        id: productData.id,
+        region: productData.region
+      }, jobId);
+    } catch (kinguinError) {
+      await logDecision("KINGUIN_API_ERROR", `Error accediendo a API de Kinguin: ${kinguinError.message}`, { error: kinguinError.message }, jobId);
+      
+      if (kinguinError.response?.status === 401) {
+        throw new Error("Error de autenticación con Kinguin API. Verifica tu KINGUIN_API_KEY en las variables de entorno.");
+      }
+      
+      throw kinguinError;
+    }
+    
+    // 🌍 VERIFICAR REGIÓN
+    const normalizedRegion = productData.region || 'Unknown';
+    const regionResult = regionVerdictLogic(normalizedRegion);
+    
+    await logStep("REGION_CHECK", `🌍 PASO 2: Verificando región "${normalizedRegion}"`, { 
+      region: normalizedRegion,
+      verdict: regionResult.verdict,
+      reason: regionResult.reason
+    }, jobId);
+    
+    if (regionResult.verdict === 'reject') {
+      await logDecision("REGION_REJECTION", `🚫 CASO 3: PRODUCTO RECHAZADO - Región "${normalizedRegion}" no permitida`, {
+        kinguin_id: kinguinId,
+        rejected_region: normalizedRegion,
+        reason: regionResult.reason,
+        product_name: productData.name
+      }, jobId);
+
+      return {
+        kinguinId,
+        status: 'skipped',
+        reason: 'region_not_allowed',
+        message: `Región "${normalizedRegion}" no permitida: ${regionResult.reason}`,
+        rejected_region: normalizedRegion,
+        success: false
+      };
+    }
+    
+    await logStep("REGION_CHECK_PASSED", `✅ PASO 2 OK: Región "${normalizedRegion}" permitida`, { 
+      region: normalizedRegion,
+      verdict: regionResult.verdict 
+    }, jobId);
+    
+    // ✅ PASO 3: AMBAS VERIFICACIONES PASADAS - PROCEDER CON PROCESAMIENTO
+    await logStep("ALL_CHECKS_PASSED", `✅ CASO 1: Todas las verificaciones pasadas - Procediendo a procesar Kinguin ID ${kinguinId}`, { 
+      kinguin_id: kinguinId,
+      region: normalizedRegion
+    }, jobId);
     
     // ✅ PASO 3: RESERVA ATÓMICA: Intentar reservar el Kinguin ID insertando un registro de "processing"
     const reservationData = {
@@ -333,26 +408,53 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       }
     }
     
-    // 1. Obtener detalles del producto desde Kinguin
-    let productData;
+    // ✅ PASO 4: CREAR REGISTRO "PROCESSING" EN SUPABASE
+    await logStep("SUPABASE_CREATE_PROCESSING", `📝 Creando registro 'processing' en Supabase para Kinguin ID ${kinguinId}`, { 
+      kinguin_id: kinguinId 
+    }, jobId);
+    
+    const reservationDataSecond = {
+      kinguin_id: kinguinId,
+      status: 'processing',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    
     try {
-      // Timeout específico para llamadas a Kinguin API (15 segundos)
-      const kinguinTimeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout: Kinguin API tomó más de 15 segundos')), 15000)
-      );
-      
-      const kinguinPromise = getKinguinProduct(kinguinId, { KINGUIN_API_KEY });
-      productData = await Promise.race([kinguinPromise, kinguinTimeoutPromise]);
-      
-      await logStep("INFO_KINGUIN", "Información obtenida de Kinguin API", { name: productData.name, platform: productData.platform, id: productData.id }, jobId);
-    } catch (kinguinError) {
-      await logDecision("ERROR", `Error accediendo a API de Kinguin: ${kinguinError.message}`, { error: kinguinError.message }, jobId);
-      
-      if (kinguinError.response?.status === 401) {
-        throw new Error("Error de autenticación con Kinguin API. Verifica tu KINGUIN_API_KEY en las variables de entorno.");
+      const { data: insertResult, error: insertError } = await supabase
+        .from("published_products")
+        .upsert(reservationDataSecond, { 
+          onConflict: 'kinguin_id',
+          ignoreDuplicates: false 
+        })
+        .select();
+        
+      if (insertError) {
+        await logDecision("SUPABASE_INSERT_ERROR", `Error creando registro en Supabase: ${insertError.message}`, { 
+          kinguin_id: kinguinId,
+          error: insertError.message
+        }, jobId);
+        
+        return { 
+          success: false, 
+          reason: "supabase_insert_error",
+          message: `Error creando registro: ${insertError.message}`
+        };
       }
       
-      throw kinguinError;
+      await logStep("SUPABASE_PROCESSING_CREATED", `✅ Registro 'processing' creado exitosamente en Supabase`, { kinguin_id: kinguinId }, jobId);
+      
+    } catch (reservationError) {
+      await logDecision("SUPABASE_RESERVATION_ERROR", `Error en reserva atómica: ${reservationError.message}`, { 
+        kinguin_id: kinguinId,
+        error: reservationError.message
+      }, jobId);
+      
+      return { 
+        success: false, 
+        reason: "reservation_error",
+        message: `Error en reserva: ${reservationError.message}`
+      };
     }
     
     // ✅ INICIALIZAR VARIABLE PARA PRODUCTO EXISTENTE
@@ -634,13 +736,13 @@ async function processSingleProduct(kinguinId, existingProduct, { ML_ACCESS_TOKE
       return { kinguinId, status: 'skipped', reason: 'invalid_product', message: `Producto rechazado: ${errors.join(", ")}`, errors, timeElapsed: `${duration}s` };
     }
     
-    // 3. Verificar la región
-    const { allowed, norm: normalizedRegion } = regionVerdictLogic(productData.regionLimitations);
+    // 3. Verificar la región (segunda verificación - legacy)
+    const { allowed, norm: normalizedRegionLegacy } = regionVerdictLogic(productData.regionLimitations);
     
     if (!allowed) {
-      await logDecision("[SKIP] RECHAZADO", `Región no permitida: ${productData.regionLimitations}`, { normalizedRegion }, jobId);
+      await logDecision("[SKIP] RECHAZADO", `Región no permitida: ${productData.regionLimitations}`, { normalizedRegionLegacy }, jobId);
       duration = (Date.now() - startTime) / 1000;
-      return { kinguinId, status: 'skipped', reason: 'invalid_region', message: `Región no permitida: ${productData.regionLimitations}`, normalizedRegion, timeElapsed: `${duration}s` };
+      return { kinguinId, status: 'skipped', reason: 'invalid_region', message: `Región no permitida: ${productData.regionLimitations}`, normalizedRegion: normalizedRegionLegacy, timeElapsed: `${duration}s` };
     }
     
     // 4. Verificar stock (considerando diferentes estructuras de respuesta de la API)
